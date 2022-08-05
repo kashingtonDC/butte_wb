@@ -1,0 +1,582 @@
+---
+title: "GWfun"
+output: html_document
+date: '2022-07-06'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Functions to estimate groundwater storage change (GWS) from groundwater level changes (GWL) and specific yield (sy)/specific storage
+```{r }
+# Library
+library(dplyr)
+library(tidyverse)
+library(raster)
+library(gstat)
+library(rgdal)
+library(RColorBrewer)
+library(zoo)
+library(lubridate)
+library(zyp)
+library(ggplot2)
+library(rstudioapi)
+library(reshape2)
+
+curr_dir = dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(curr_dir)
+setwd('..')
+
+source(paste0(curr_dir,'/dirs.R'))
+```
+
+
+```{r , echo=FALSE}
+#========================================================
+# Estimate groundwater level changes in the study reagion
+#
+# Args: 
+# sub_sel = subregion
+#========================================================
+wse_idw = function(sub_sel = 5){
+  
+  # Month list
+  mn.all = c('jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec')
+  
+  # Loop through the months
+  for (mn_use in mn.all) {
+    
+    # Remove all variables except month info
+    # rm(list=setdiff(ls(), c("mn.all","mn_use","sub_sel")))
+    
+    # Set working directory to current
+    curr_dir = dirname(rstudioapi::getSourceEditorContext()$path)
+    
+    # Reading directory locations
+    source(paste0(curr_dir,'/dirs.R'))
+    
+    # get sets of overlapping points
+    get_set = function(x, y){zerodist(x)[, y]}
+    
+    # fix incorrect values: remove NAs
+    no_na = function(x){x[!is.na(df.cv$WSE),]}
+    
+    # Loop through the years    
+    for(yr in 2002:2020){
+      
+      # Reading shapefiles
+      interp_boundary = readOGR(paste0(wd$shp,'CV_subregion.shp'))
+      interp_boundary_kw = interp_boundary[sub_sel,]
+      interp_boundary= interp_boundary[interp_boundary$SubRegion %in% c(1:21),]
+      crs_bnd = crs(interp_boundary) # shape coordinate
+      
+      # Skipping months in 2020 for which data not available
+      if(yr == 2020 & mn_use=='apr'){next()};if(yr == 2020 & mn_use == 'may'){next()};if(yr == 2020 & mn_use == 'jun'){next()};
+      if(yr == 2020 & mn_use=='jul'){next()};if(yr == 2020 & mn_use == 'aug'){next()};if(yr == 2020 & mn_use == 'sep'){next()};
+      if(yr == 2020 & mn_use=='oct'){next()};if(yr == 2020 & mn_use == 'nov'){next()};if(yr == 2020 & mn_use == 'dec'){next()};
+      
+      # read well data 
+      df = readRDS(paste0(wd$wse_data,'WSE_avg_',mn_use,'_2002_2019_ft_initialData_all_stations_40861.rds'))
+      
+      # Select specific column data in a dataframe
+      id.tmp = which(names(df) == paste0(yr))
+      df[,id.tmp] = df[,id.tmp]/3.28 #ft to meter
+      df = df[,c(1:3,id.tmp)]
+      df = na.omit(df)
+      colnames(df) = c('site_code', 'LATITUDE' ,'LONGITUDE' ,'WSE')
+      
+      # Convert to spatial 
+      coordinates(df) = ~  LONGITUDE + LATITUDE
+      crs(df) = "+proj=longlat +datum=WGS84"#'+proj=utm +zone=10 +ellps=GRS80 +datum=NAD83'
+      
+      # Change coordinate
+      df = spTransform(df, crs_bnd)
+      df = crop(df,interp_boundary)
+      if(nrow(df)<=1){next}
+      
+      # High anomaly in year 2007 and 2006. Removing data that is higher than 99.8th percentile
+      if(yr == 2007 | yr == 2006){
+        if(mn_use == 'feb' | mn_use == 'mar' | mn_use == 'apr' | mn_use == 'may' |
+           mn_use == 'jun' | mn_use == 'jul' | mn_use == 'aug' | mn_use == 'sep'){
+          a = data.frame(df); plot(a$WSE)
+          median(a$WSE)
+          
+          up_lim = quantile(a$WSE, probs = c(.998), na.rm = T)
+          low_lim = quantile(a$WSE, probs = c(.001), na.rm = T)
+          
+          id.high = which(a$WSE>up_lim);
+          id.low = which(a$WSE<low_lim)
+          # id.both = c(id.high,id.low)
+          id.both = c(id.high)
+          a = a[-id.both,]
+          plot(a$WSE)
+          coordinates(a) = ~  LONGITUDE + LATITUDE
+          crs(a) = crs_bnd #"+proj=longlat +datum=WGS84"#'+proj=utm +zone=10 +ellps=GRS80 +datum=NAD83'
+          df = a #spTransform(a, crs_bnd)
+          df = df[,c(1,2)]
+        }
+      }
+      
+      # Creating blank raster
+      r      = raster(extent(interp_boundary))           
+      res(r) = 10000   # Raster resolution 1000 meters
+      crs(r) = crs_bnd # Assigning coordinate
+      
+      #====================== Find optimum parameter for IDW =======================
+      RMSE = function(observed, predicted) {
+        sqrt(mean((predicted - observed)^2, na.rm=TRUE))
+      }
+      f1 = function(x, test, train) {
+        nmx = x[1]
+        idp = x[2]
+        if (nmx < 1) return(Inf)
+        if (idp < .001) return(Inf)
+        m = gstat(formula=WSE~1, locations=train, nmax=nmx, set=list(idp=idp))
+        p = predict(m, newdata=test, debug.level=0)$var1.pred
+        RMSE(test$WSE, p)
+      }
+      set.seed(20150518)
+      i = sample(nrow(df), 0.2 * nrow(df))
+      tst = df[i,]
+      trn = df[-i,]
+      opt = optim(c(8, .5), f1, test=tst, train=trn)
+      opt
+      #===================================================
+      
+      m = gstat(formula=WSE~1, locations=df, nmax=opt$par[1], set=list(idp=opt$par[2]))
+      idw = interpolate(r, m)
+      
+      ## [inverse distance weighted interpolation]
+      idwr = mask(idw, interp_boundary)
+      plot(idwr)
+      
+      idwr = mask(crop(idwr,interp_boundary_kw),interp_boundary_kw)
+      
+      spplot(idwr)
+      
+      saveRDS(idwr,paste0(wd$GWL_data,'2_3_wse_idw_initial_all_type/2_32_WSE_m_predcted_initial_all_type_IDWoptimParam_upto_',yr,'_',mn_use,'_40861.rds'))
+    }
+  }
+}
+
+#========================================================
+# Estimate GWS changes in the study region
+#
+# Args: 
+# flag: 1: GWS = head change x Sy x A; 2: GWS in mm
+# flag_2: 1: Sy true; 2: Sy false
+# flag_3: 1: C2vsim sy; 2: CVHM sy ; 3: C2vsim sy dec 2020 release
+# strt_yr: Calculation starting year
+# end_yr: Calculation ending year
+# ma.mon: moving average months
+#========================================================
+
+gws_from_gwl_ss = function(flag = 1, flag_2=1, flag_3 = 3, data_type = 1, ma.mon = 8, strt_yr =2002, end_yr = 2019){
+  
+  # get sets of overlapping points
+  get_set <- function(x, y){zerodist(x)[, y]}
+  
+  # fix incorrect values: remove NAs
+  no_na <- function(x){x[!is.na(df.cv$WSE),]}
+  
+  wd_tmp = list()
+  #storing directories in a list
+  if(data_type == 1){wd_tmp$data = paste0(wd$GWL_data,'2_3_wse_idw_initial_all_type/')}
+  if(data_type == 2){wd_tmp$data = paste0(wd$GWL_data,'2_2_wse_idw_initial_tyler_match/')}
+  if(data_type == 3){wd_tmp$data = paste0(wd$GWL_data,'2_1_wse_idw_tyler_upto2015/')}
+  
+  # read central valley shape
+  interp_boundary = readOGR(paste0(wd$shp,'CV_subregion.shp'))
+  crs_bnd = crs(interp_boundary) # coordinate system
+  
+  # Read specific storage data
+  if(flag_2==1){
+    if(flag_3==1){
+      r.sy = brick(paste0(wd$ss,'sy_krig_ly1_31.tif'))
+      crs_sy = crs(r.sy)
+      r.sy.coarse <- aggregate(r.sy, fact=10000/2000)
+    }
+    if(flag_3==2){
+      r.sy2 = brick(paste0(wd$ss_c2vsim,'ss_ly24_CV1.tif'))
+      r.sy2 = r.sy2/100
+      cellStats(r.sy2,mean)
+      r.sy.coarse=aggregate(r.sy2, fact=10000/2000)
+    }
+    if(flag_3==3){
+      r.sy = brick(paste0(wd$ss_c2vsim,'ss_ly24_CV1.tif'))
+      cellStats(r.sy,mean)
+      r.sy.coarse=aggregate(r.sy, fact=10000/2000)
+    }
+  }
+  if(flag_2==2){
+    r.sy.coarse = 1
+  }
+  
+  
+  # setwd(wd_tmp$data)
+  # Create blank list to store interpolated data
+  r.tmp = list()
+  
+  # Months
+  mn_use = c('jan','feb','mar','apr', 'may', 'jun','jul','aug','sep','oct','nov','dec')
+  
+  # Read interpolated data in loop
+  t = 1
+  for(i in strt_yr:end_yr){
+    for(j in 1:length(mn_use)){
+      print(paste0('Year = ', i,', month = ',j))
+      if(data_type == 1){
+        fl.nm = paste0(wd_tmp$data,'2_32_WSE_m_predcted_initial_all_type_IDWoptimParam_upto_',i,'_',mn_use[j],'_40861.rds')
+        r.tmp[[t]] = readRDS(fl.nm)
+      }  
+      
+      if(data_type == 2){r.tmp[[t]] = readRDS(paste0(wd_tmp$data,'WSE_m_predcted_initial_tyler_match_upto_',i,'_',mn_use[j],'.rds'))}
+      
+      if(data_type == 3){
+        if(i==2015 & j==10){break}
+        r.tmp[[t]] = readRDS(paste0(wd_tmp$data,'WSE_m_predcted_tyler_upto_',i,'_',mn_use[j],'.rds'))}
+      t = t+1
+    }
+    
+    if(data_type == 3){
+      if(i==2015 & j==10){break}}
+  }
+  
+  # Calculate the difference in head between two time steps and multiply with specific yield
+  # NB: Here specific storage is for the whole region, but it only uses overlapped area for multiplication
+  g.all = 0
+  for(i in 2:length(r.tmp)){
+    if(flag==1){r.tmp.diff = (r.tmp[[i]] - r.tmp[[i-1]])*r.sy.coarse
+    r.tmp.pred2 = cellStats(r.tmp.diff, stat='mean', na.rm=TRUE)*interp_boundary@data$area_sqkm[5]/1000}
+    
+    if(flag==2){r.tmp.diff = (r.tmp[[i]] - r.tmp[[i-1]])
+    r.tmp.pred2 = cellStats(r.tmp.diff, stat='mean', na.rm=TRUE)}
+    
+    g.all = c(g.all,r.tmp.pred2)
+  }
+  
+  # Cumulative GWS
+  g.all.cum = cumsum(g.all)
+  
+  if(length(mn_use)>4 & data_type != 3){yr = rep(strt_yr:end_yr, each = length(mn_use)); mn = rep(c(1:12), times = length(strt_yr:end_yr))}
+  if(length(mn_use)>4 & data_type == 3){yr = rep(strt_yr:2015, each = length(mn_use)); yr = yr[1:(length(yr)-3)]
+  
+  # Create month series
+  mn = rep(c(1:12), times = length(strt_yr:2015)); mn = mn[1:(length(mn)-3)]}
+  
+  # Create date series
+  dt = as.Date(paste0(15,'/',mn,'/',yr),format = '%d/%m/%Y')
+  
+  # Create dataframe with date and GWS estimates
+  df.g.all = data.frame(year = dt , gws_km3 = g.all.cum) 
+  
+  #color palette
+  my.palette <- brewer.pal(n = 7, name = "RdBu")
+  
+  df.tmp.out = data.frame(Date = df.g.all[,1], cum_gws_km3 = df.g.all[,2], gws_change = g.all)
+  
+  #============================ Export data ==================================
+  
+  df.g.all.ma = rollmean(df.g.all[,2],ma.mon)
+  df.g.all.ma = data.frame(year = df.g.all[,1],gws_km3=c(rep(NA,times=(ma.mon/2-1)),df.g.all.ma,rep(NA,times=ma.mon/2)))
+  
+  df.g.all.ma2 = df.g.all.ma
+  df.g.all.ma2[,1] = as.integer(df.g.all.ma[,1])
+  slope_calc = function(yr.strt,yr.end){
+    a = list()
+    id.tmp.st = which(year(df.g.all.ma[,1])==yr.strt & month(df.g.all.ma[,1])==10)
+    if(length(id.tmp.st)==0){
+      id.tmp.st = which(year(df.g.all.ma[,1])==yr.strt & month(df.g.all.ma[,1])==12)
+    }
+    id.tmp.end = which(year(df.g.all.ma[,1])==yr.end & month(df.g.all.ma[,1])==9)
+    a[[1]] = c(id.tmp.st,id.tmp.end)
+    df.g.all.ma2.tmp = df.g.all.ma2[id.tmp.st:id.tmp.end,]; id.tmp = which(is.na(df.g.all.ma2.tmp[,2])==T)
+    if(length(id.tmp)>0){df.g.all.ma2.tmp = df.g.all.ma2.tmp[-id.tmp,]}
+    
+    stat.sen = zyp.sen(gws_km3~year, df.g.all.ma2.tmp)
+    a[[2]] = stat.sen
+    return(a)
+  }
+  
+  #=============== separating months of interest========================
+  # mn = month(df.g.all.ma[,1]);df.g.all.ma2 = df.g.all.ma[mn %in% c(4,10),]
+  df.g.all.ma2 = df.g.all.ma
+  #=======================================
+  
+  # Plot GWS time series
+  p = ggplot(df.g.all.ma2, aes(x = year, y = gws_km3))+
+    geom_line(size=.7,color = 'red')+ 
+    ylab(expression(paste("Cum. GWS change ", (km^3),sep="")))+
+    theme_bw()+ labs(color='Methods')+
+    scale_x_date(date_breaks = "2 years",
+                 date_minor_breaks = "years",date_labels = "%Y")+
+    # scale_color_manual(values = c('blue','red'))+
+    theme(axis.text.y = element_text(color = "black", size = 12),
+          axis.title.y = element_text(color = "black", size = 13),
+          axis.text.x = element_text(color = "black", size = 12, angle = 0, hjust = .5, vjust = .5),
+          axis.title.x = element_text(color = "black", size = 13))+
+    xlab('Years')
+  scale_y_continuous(breaks = seq(-20, 5, by=5), limits=c(-20,5))
+  
+  p
+  
+  # export figure
+  ggsave(p,filename = paste0(wd$figure,'GWS_CV_well_',ma.mon,'_ss.png'),
+         width = 20, height = 7, units = "cm")
+  
+  
+  df.g.all = cbind(df.g.all,df.g.all.ma); df.g.all = df.g.all[,-3]
+  colnames(df.g.all) = c('year','gws_km3',paste0('gws_km3_',ma.mon))
+  
+  # Export GWS changes 
+  write.csv(df.g.all,paste0(wd$GWS_data,'GWS_MA',ma.mon,'_ss.csv'))
+  
+}
+
+
+#========================================================
+# Estimate GWS changes in the study region
+#
+# Args: 
+# flag: 1: GWS = head change x Sy x A; 2: GWS in mm
+# flag_2: 1: Sy true; 2: Sy false
+# flag_3: 1: C2vsim sy; 2: CVHM sy ; 3: C2vsim sy dec 2020 release
+# strt_yr: Calculation starting year
+# end_yr: Calculation ending year
+# ma.mon: moving average months
+#========================================================
+
+gws_from_gwl_sy = function(flag = 1, flag_2=1, flag_3 = 3, data_type = 1, ma.mon, strt_yr =2002, end_yr = 2019){
+  
+  # get sets of overlapping points
+  get_set <- function(x, y){zerodist(x)[, y]}
+  
+  # fix incorrect values: remove NAs
+  no_na <- function(x){x[!is.na(df.cv$WSE),]}
+  
+  
+  #storing directories in a list
+  wd_tmp =list()
+  if(data_type == 1){wd_tmp$data = paste0(wd$GWL_data,'2_3_wse_idw_initial_all_type/')}
+  if(data_type == 2){wd_tmp$data = paste0(wd$GWL_data,'2_2_wse_idw_initial_tyler_match/')}
+  if(data_type == 3){wd_tmp$data = paste0(wd$GWL_data,'2_1_wse_idw_tyler_upto2015/')}
+  
+  # read central valley shape
+  interp_boundary = readOGR(paste0(wd$shp,'CV_subregion.shp'))
+  crs_bnd = crs(interp_boundary) # coordinate system
+  
+  if(flag_2==1){
+    if(flag_3==1){
+      r.sy = brick(paste0(wd$sy,'sy_krig_ly1_31.tif'))
+      crs_sy = crs(r.sy)
+      r.sy.coarse <- aggregate(r.sy, fact=10000/2000)
+    }
+    if(flag_3==2){
+      r.sy2 = brick(paste0(wd$sy_c2vsim,'CVHM_sy1_nadUTM_2000m.tif'))
+      r.sy2 = r.sy2/100
+      cellStats(r.sy2,mean)
+      r.sy.coarse=aggregate(r.sy2, fact=10000/2000)
+    }
+    if(flag_3==3){
+      r.sy = brick(paste0(wd$sy_c2vsim,'SY_C2VSIM_Dec_2000m.tif'))
+      cellStats(r.sy,mean)
+      r.sy.coarse=aggregate(r.sy, fact=10000/2000)
+    }
+  }
+  if(flag_2==2){
+    r.sy.coarse = 1
+  }
+  
+  # setwd(wd_tmp$data)
+  r.tmp = list()
+  
+  # Months
+  mn_use = c('jan','feb','mar','apr', 'may', 'jun','jul','aug','sep','oct','nov','dec')
+  
+  # Read interpolated data in loop
+  t = 1
+  for(i in strt_yr:end_yr){
+    for(j in 1:length(mn_use)){
+      print(paste0('Year = ', i,', month = ',j))
+      if(data_type == 1){
+        fl.nm = paste0(wd_tmp$data,'2_32_WSE_m_predcted_initial_all_type_IDWoptimParam_upto_',i,'_',mn_use[j],'_40861.rds')
+        r.tmp[[t]] = readRDS(fl.nm)
+      }  
+      
+      if(data_type == 2){r.tmp[[t]] = readRDS(paste0(wd_tmp$data,'WSE_m_predcted_initial_tyler_match_upto_',i,'_',mn_use[j],'.rds'))}
+      
+      if(data_type == 3){
+        if(i==2015 & j==10){break}
+        r.tmp[[t]] = readRDS(paste0(wd_tmp$data,'WSE_m_predcted_tyler_upto_',i,'_',mn_use[j],'.rds'))}
+      t = t+1
+    }
+    
+    if(data_type == 3){
+      if(i==2015 & j==10){break}}
+  }
+  
+  # Calculate the difference in head between two time steps and multiply with specific yield
+  # NB: Here specific yield is for the whole region, but it only uses overlapped area for multiplication
+  g.all = 0
+  for(i in 2:length(r.tmp)){
+    if(flag==1){r.tmp.diff = (r.tmp[[i]] - r.tmp[[i-1]])*r.sy.coarse
+    r.tmp.pred2 = cellStats(r.tmp.diff, stat='mean', na.rm=TRUE)*interp_boundary@data$area_sqkm[5]/1000}
+    if(flag==2){r.tmp.diff = (r.tmp[[i]] - r.tmp[[i-1]])
+    r.tmp.pred2 = cellStats(r.tmp.diff, stat='mean', na.rm=TRUE)}
+    
+    g.all = c(g.all,r.tmp.pred2)
+  }
+  
+  
+  # Cumulative GWS
+  g.all.cum = cumsum(g.all)
+  
+  if(length(mn_use)>4 & data_type != 3){yr = rep(strt_yr:end_yr, each = length(mn_use)); mn = rep(c(1:12), times = length(strt_yr:end_yr))}
+  if(length(mn_use)>4 & data_type == 3){yr = rep(strt_yr:2015, each = length(mn_use)); yr = yr[1:(length(yr)-3)]
+  
+  # Create month series
+  mn = rep(c(1:12), times = length(strt_yr:2015)); mn = mn[1:(length(mn)-3)]}
+  
+  # Create date series
+  dt = as.Date(paste0(15,'/',mn,'/',yr),format = '%d/%m/%Y')
+  
+  # Create dataframe with date and GWS estimates
+  df.g.all = data.frame(year = dt , gws_km3 = g.all.cum) 
+  
+  #color palette
+  my.palette <- brewer.pal(n = 7, name = "RdBu")
+  
+  df.tmp.out = data.frame(Date = df.g.all[,1], cum_gws_km3 = df.g.all[,2], gws_change = g.all)
+  
+  #============================ Export data ==================================
+  
+  df.g.all.ma = rollmean(df.g.all[,2],ma.mon)
+  df.g.all.ma = data.frame(year = df.g.all[,1],gws_km3=c(rep(NA,times=(ma.mon/2-1)),df.g.all.ma,rep(NA,times=ma.mon/2)))
+  
+  df.g.all.ma2 = df.g.all.ma
+  df.g.all.ma2[,1] = as.integer(df.g.all.ma[,1])
+  slope_calc = function(yr.strt,yr.end){
+    a = list()
+    id.tmp.st = which(year(df.g.all.ma[,1])==yr.strt & month(df.g.all.ma[,1])==10)
+    if(length(id.tmp.st)==0){
+      id.tmp.st = which(year(df.g.all.ma[,1])==yr.strt & month(df.g.all.ma[,1])==12)
+    }
+    id.tmp.end = which(year(df.g.all.ma[,1])==yr.end & month(df.g.all.ma[,1])==9)
+    a[[1]] = c(id.tmp.st,id.tmp.end)
+    df.g.all.ma2.tmp = df.g.all.ma2[id.tmp.st:id.tmp.end,]; id.tmp = which(is.na(df.g.all.ma2.tmp[,2])==T)
+    if(length(id.tmp)>0){df.g.all.ma2.tmp = df.g.all.ma2.tmp[-id.tmp,]}
+    
+    stat.sen = zyp.sen(gws_km3~year, df.g.all.ma2.tmp)
+    a[[2]] = stat.sen
+    return(a)
+  }
+  
+  #=============== separating months of interest========================
+  # mn = month(df.g.all.ma[,1]);df.g.all.ma2 = df.g.all.ma[mn %in% c(4,10),]
+  df.g.all.ma2 = df.g.all.ma
+  #=======================================
+  
+  # Plot GWS time series
+  p = ggplot(df.g.all.ma2, aes(x = year, y = gws_km3))+
+    geom_line(size=.7,color = 'red')+ 
+    ylab(expression(paste("Cum. GWS change ", (km^3),sep="")))+
+    theme_bw()+ labs(color='Methods')+
+    scale_x_date(date_breaks = "2 years",
+                 date_minor_breaks = "years",date_labels = "%Y")+
+    # scale_color_manual(values = c('blue','red'))+
+    theme(axis.text.y = element_text(color = "black", size = 12),
+          axis.title.y = element_text(color = "black", size = 13),
+          axis.text.x = element_text(color = "black", size = 12, angle = 0, hjust = .5, vjust = .5),
+          axis.title.x = element_text(color = "black", size = 13))+
+    xlab('Years')
+  scale_y_continuous(breaks = seq(-20, 5, by=5), limits=c(-20,5))
+  
+  p
+  
+  # export figure
+  ggsave(p,filename = paste0(wd$figure,'GWS_CV_well_',ma.mon,'_sy.png'),
+         width = 20, height = 7, units = "cm")
+  
+  df.g.all = cbind(df.g.all,df.g.all.ma); df.g.all = df.g.all[,-3]
+  colnames(df.g.all) = c('year','gws_km3',paste0('gws_km3_',ma.mon))
+  
+  # Export GWS changes 
+  write.csv(df.g.all,paste0(wd$GWS_data,'GWS_MA',ma.mon,'_sy.csv'))
+}
+
+#########################################################################################
+# Plots groundwater storage (GWS) change time series. GWS estimates were made using
+# specific yield (sy) and specific storage (ss).
+#########################################################################################
+
+#========================================================
+# Plots GWS in the study region
+#
+# Args: 
+# strt_yr: starting year; end_yr = end year
+# ma = moving average
+#========================================================
+
+plot_gws = function(strt_yr =2002, end_yr = 2019,ma){
+  
+  #plot color palette
+  my.palette <- brewer.pal(n = 7, name = "RdBu")
+  
+  # Read GWS estimates
+  df_sy = read.csv(paste0(wd$GWS_data,'GWS_MA',ma,'_sy.csv'))
+  df_ss = read.csv(paste0(wd$GWS_data,'GWS_MA',ma,'_ss.csv'))
+  df = data.frame(year = df_sy$year, GWS_ss = df_ss[,4], GWS_sy = df_sy[,4], GWS_avg =(df_ss[,4]+df_sy[,4])*.5 )
+  df[,1] = as.Date(df[,1], format = '%Y-%m-%d')
+  
+  # Reshape data for plotting
+  mdat = melt(df, id.var = c('year'))
+  
+  p = ggplot(mdat, aes(x = year, y = value,color = variable))+
+    geom_line(size=1)+ 
+    ylab(expression(paste("Cum. ", Delta~S[GW] ,' ', (km^3),sep="")))+
+    theme_bw()+ labs(color='Methods')+
+    scale_x_date(date_breaks = "2 years",
+                 date_minor_breaks = "years",date_labels = "%Y")+
+    # scale_color_manual(values = c('blue','red'))+
+    theme(axis.text.y = element_text(color = "black", size = 12),
+          axis.title.y = element_text(color = "black", size = 13),
+          axis.text.x = element_text(color = "black", size = 12, angle = 0, hjust = .5, vjust = .5),
+          axis.title.x = element_text(color = "black", size = 13))+
+    xlab('Years')+
+    scale_y_continuous(breaks = seq(-3, 1, by=.5), limits=c(-3,1))+
+    scale_color_manual(values = c('darkgreen','blue','red'))
+  
+  p
+  
+  # Export figure
+  ggsave(p,filename = paste0(wd$figure,'GWS_wellBased_ma',ma,'.png'),
+         width = 20, height = 7, units = "cm")
+  
+  # Export csv
+  write.csv(df,paste0(wd$GWS_data,'GWS_MA',ma,'_ss_sy_comb.csv'))
+  
+}
+
+
+```
+
+### Run Main codes
+```{r , echo=FALSE}
+# Moving average months
+ma.sel = 4
+
+# Interpolate groundwater level data using inverse distance Weighing
+# wse_idw(sub_sel = 5)
+
+# GWS using interpolated groundwater level and specific storage (ss)
+gws_from_gwl_ss(flag = 1, flag_2=1, flag_3 = 3, data_type = 1, ma.mon = ma.sel, strt_yr =2002, end_yr = 2019)
+
+# GWS using interpolated groundwater level and specific yield (sy)
+gws_from_gwl_sy(flag = 1, flag_2=1, flag_3 = 3, data_type = 1, ma.mon = ma.sel, strt_yr =2002, end_yr = 2019)
+
+# Plot GWS changes
+plot_gws(strt_yr =2002, end_yr = 2019,ma = ma.sel)
+
+
+```
