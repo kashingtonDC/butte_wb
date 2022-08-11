@@ -817,7 +817,7 @@ def load_data():
 	data['gldas_qsm'] = [ee.ImageCollection('NASA/GLDAS/V021/NOAH/G025/fT3H'), "Qsm_acc", 1, 27830]
 
 	# ECMWF
-	data['ecmwf_r'] = [ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY") , 'runoff', 1e3, 11132] # m --> mm 
+	data['ecmwf_r'] = [ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY") , 'runoff', 3e4, 11132] # m/d --> mm/mon
 	
 	#####################
 	##### SM data #######
